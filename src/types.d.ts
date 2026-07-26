@@ -72,4 +72,10 @@ interface SubtitleStream {
 }
 
 type StreamInfo = VideoStream | AudioStream | GraphicsStream | SubtitleStream;
-type StreamMap = Record<number, StreamInfo>;
+type StreamInfoWithPid = { pid: number } & StreamInfo;
+type StreamMap = Record<number, { idx: number } & StreamInfo>;
+
+interface StreamObj {
+  arr: StreamInfoWithPid[];
+  map: StreamMap;
+}

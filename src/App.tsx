@@ -1,9 +1,8 @@
 import './App.css';
-import * as Comlink from 'comlink';
 import { ChevronRight } from '@mui/icons-material';
 import { Alert, Box, Button, CircularProgress, Input, List, ListItem, ListItemButton, ListItemIcon, ListItemText, ListSubheader } from '@mui/material';
 import { skipToken, useQuery } from '@tanstack/react-query';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { convertSecondsToTimestamp } from './utils.ts';
 
 const demuxWorker = new ComlinkWorker<
@@ -65,12 +64,18 @@ export default function App() {
     staleTime: Infinity,
   });
 
+  const url = useMemo(() => data && URL.createObjectURL(data), [data]);
+
   const selectFolder = useCallback(async () => {
     const { error, folder } = await getFolder();
     if (error) setError(error);
     if (folder) {
+      setError('');
       setRootDirectory(folder);
       setMessage('Loaded ' + folder.name);
+      setPlaylist(null);
+      setChapters([]);
+      setProcessing(false);
     };
   }, []);
 
@@ -143,8 +148,9 @@ export default function App() {
           />
         </ListItem>) }
       </List> }
-      { processing &&
+      { processing && !url &&
       <CircularProgress /> }
+      {url && <video src={url} controls/>}
     </Box>
   );
 }

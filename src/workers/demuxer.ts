@@ -74,12 +74,21 @@ const readPlaylist = function(buf: ArrayBuffer) {
       throw new Error('Incorrect CodecIdentifier.');
 
     // const isMultiAngle = playitemView.getUint8(10) & 0x10;
+    // const angleCount = isMultiAngle ? playitemView.getUint8(24) : 1
 
     // const stcId = playitemView.getUint8(11);
     const inTime = playitemView.getUint32(12);
     const outTime = playitemView.getUint32(16);
+    // const stnStart = idx + 38 + isMultiAngle * 2 + (angleCount - 1) * 10;
+    // const stnView = new DataView(buf, stnStart);
+    // const numVideo = stnView.getUint8(0);
+    // const numAudio = stnView.getUint8(1);
+    // const numPg = stnView.getUint8(2);
     
-    // const clipStartIdx = 5 + (isMultiAngle * 2);
+    // let strIdx = 12;
+    // for (let j = 0; j < numVideo; j++) {
+
+    // }
 
     playitems.push({ clipId, inTime, outTime });
 
@@ -121,11 +130,11 @@ const readClip = function(buf: ArrayBuffer) {
   const numProgs = piView.getUint8(0);
 
   let idx = programInfoStartAddr + 6;
-  const programs: StreamMap[] = [];
+  const programs: StreamObj[] = [];
   for (let i = 0; i < numProgs; i++) {
     const programView = new DataView(buf, idx);
     const numStreams = programView.getUint8(6);
-    programs[i] = {};
+    programs[i] = { arr: [], map: {} };
     idx += 8;
     for (let j = 0; j < numStreams; j++) {
       const streamView = new DataView(buf, idx);
@@ -143,7 +152,9 @@ const readClip = function(buf: ArrayBuffer) {
           const format = (b1 & 0xF0) >> 4;
           const rate = b1 & 0x0F;
           const aspect = (streamView.getUint8(5) & 0xF0) >> 4;
-          programs[i][pid] = { codingType,  format, rate, aspect };
+          const obj = { codingType, format, rate, aspect };
+          programs[i].map[pid] = { idx: j, ...obj };
+          programs[i].arr.push({ pid, ...obj });
           break;
         }
 
@@ -162,7 +173,9 @@ const readClip = function(buf: ArrayBuffer) {
           const format = (b1 & 0xF0) >> 4;
           const rate = b1 & 0x0F;
           const lang = readString(streamView, 5, 3);
-          programs[i][pid] = { codingType, format, rate, lang };
+          const obj = { codingType, format, rate, lang };
+          programs[i].map[pid] = { idx: j, ...obj };
+          programs[i].arr.push({ pid, ...obj });
           break;
         }
 
@@ -170,14 +183,18 @@ const readClip = function(buf: ArrayBuffer) {
         case 0x91:
         case 0xa0: {
           const lang = readString(streamView, 4, 3);
-          programs[i][pid] = { codingType, lang };
+          const obj = { codingType, lang };
+          programs[i].map[pid] = { idx: j, ...obj };
+          programs[i].arr.push({ pid, ...obj });
           break;
         }
 
         case 0x92: {
           const charCode = streamView.getUint8(4);
           const lang = readString(streamView, 5, 3);
-          programs[i][pid] = { codingType, charCode, lang };
+          const obj = { codingType, charCode, lang };
+          programs[i].map[pid] = { idx: j, ...obj };
+          programs[i].arr.push({ pid, ...obj });
           break;
         }
 
@@ -247,12 +264,20 @@ export const processPlaylist = async function(
         .then(buf => ({ [clipId]: readClip(buf).flat() }));
     })
   ).then(info => info.reduce((map, i) => ({ ...map, ...i }), {}));
-  console.log(clipInfo)
+
+  const playitem = playlist.playitems[0];
+  
+  const opfs = await navigator.storage.getDirectory();
+  const fh = await opfs.getFileHandle(
+    `${playitem.clipId}.mkv`, { create: true }
+  );
+  const ws = await fh.createWritable();
   
   const demuxer = new Demuxer(root.directory[
-    `${root.name}/BDMV/STREAM/${playlist.playitems[0].clipId}.m2ts`
-  ], clipInfo[playlist.playitems[0].clipId]);
+    `${root.name}/BDMV/STREAM/${playitem.clipId}.m2ts`
+  ], clipInfo[playitem.clipId], playitem.inTime, ws);
 
-  demuxer.demux();
-  return true;
+  await demuxer.demux();
+
+  return fh.getFile();
 }

@@ -1,3 +1,5 @@
+import { EncodedAudioPacketSource, EncodedPacket, EncodedVideoPacketSource, MkvOutputFormat, Output, StreamTarget, type AudioCodec } from 'mediabunny';
+
 enum StreamType {
   VIDEO_H264 = 0x1B,
   VIDEO_H265 = 0x24,
@@ -19,6 +21,8 @@ export enum ChannelLayouts {
   LAYOUT_7_1,
 }
 
+const VIDEO_RATES = [ 0, 23.976, 24, 25, 29.97, 0, 50, 59.94 ];
+
 const SAMPLE_RATES = [null, 48000, null, null, 96000, 192000];
 
 // const valueToHex = function(value: number, byteCount: number) {
@@ -30,18 +34,39 @@ export default class Demuxer {
 
   private file: File;
   private streamMap: StreamMap;
+  private streamArr: StreamInfoWithPid[];
   private streamSet = new Set<number>();
-  private fileHandleMap: Record<number, FileSystemSyncAccessHandle> = {};
+  // private fileHandleMap: Record<number, FileSystemSyncAccessHandle> = {};
+  private sourceMap: Record<number, EncodedVideoPacketSource | EncodedAudioPacketSource> = {};
+  private output: Output;
+  private backlogMap: Record<number, EncodedPacket[]> = {};
+  private inTime: number;
 
-  constructor(file: File, programs: StreamMap[]) {
+  size: number;
+  progress = 0;
+
+  constructor(
+    file: File, programs: StreamObj[], inTime: number,
+    writeStream: WritableStream,
+  ) {
     this.file = file;
-    this.streamMap = programs[0];
-    Object.keys(this.streamMap)
-      .forEach(s => {
-        const pid = Number(s);
-        this.chunksMap[pid] = [];
-        this.streamSet.add(pid);
-      });
+    this.size = file.size;
+    this.streamMap = programs[0].map;
+    this.streamArr = programs[0].arr;
+    this.inTime = inTime;
+
+    this.output = new Output({
+      format: new MkvOutputFormat(),
+      target: new StreamTarget(writeStream),
+      onFinalize() {
+        console.log('file written!');
+      }
+    });;
+
+    this.streamArr.forEach(s => {
+      this.chunksMap[s.pid] = [];
+      this.streamSet.add(s.pid);
+    });
   }
 
   async parsePacket(pid: number) {
@@ -57,21 +82,79 @@ export default class Demuxer {
       return;
     }
 
+    const header = packetView.getUint16(6);
+    const ptsDtsIndicator = (header & 0xC0) >> 6;
+    const pts = Boolean(ptsDtsIndicator & 0b10);
+    // const dts = Boolean(ptsDtsIndicator & 0b01);
     const headerLength = packetView.getUint8(8);
+    
+    const timestamp = pts ? Number(
+      (BigInt(packet[9]) & 0x0En) << 30n |
+      (BigInt(packetView.getUint16(10)) & 0xFFFEn) << 15n |
+      (BigInt(packetView.getUint16(12)) & 0xFFFEn)
+    ) : null;
 
+    if (!timestamp) {
+      console.error('No PTS in PES packet.');
+      return;
+    }
+
+    const ts = (timestamp - this.inTime * 4) / 180000;
     const data = packet.slice(9 + headerLength);
 
     switch (this.streamMap[pid].codingType) {
       case StreamType.VIDEO_H264: {
-        if (!this.fileHandleMap[pid]) {
-          const opfs = await navigator.storage.getDirectory();
-          const fh = await opfs.getFileHandle(`${pid}.h264`, { create: true });
-          this.fileHandleMap[pid] = await fh.createSyncAccessHandle();
+        const streamInfo = this.streamMap[pid] as VideoStream;
+
+        const frameRate = streamInfo.rate === 1
+          ? 24000/1001
+          : streamInfo.rate === 4
+            ? 30000/1001
+            : streamInfo.rate === 7
+              ? 60000/1001
+              : VIDEO_RATES[streamInfo.rate];
+
+        if (!this.sourceMap[pid]) {
+          const init = this.streamArr.slice(0, this.streamMap[pid].idx)
+            .every(s => this.sourceMap[s.pid]);
+
+          if (init) {
+            this.sourceMap[pid] = new EncodedVideoPacketSource('avc');
+            this.output.addVideoTrack(this.sourceMap[pid], { frameRate });
+          }
         }
-        this.fileHandleMap[pid].write(
-          data, { at: this.fileHandleMap[pid].getSize() }
+
+        const source = this.sourceMap[pid] as EncodedVideoPacketSource;
+
+        const packet = new EncodedPacket(
+          data, data[5] === 0x10 ? 'key' : 'delta', 
+          ts, 1 / frameRate,
         );
-        this.fileHandleMap[pid].flush();
+
+        const config = {
+          decoderConfig: {
+            codec: 'avc1.640029',
+            codedHeight: streamInfo.format === 8 ? 3840 : 1920,
+            codedWidth: streamInfo.format === 8 ? 2160 : 1080,
+          }
+        };
+
+        this.backlogMap[pid] ??= [];
+        if (this.output.state === 'started') {
+          if (this.backlogMap[pid].length) {
+            this.backlogMap[pid].map(packet => source.add(packet, config));
+            this.backlogMap[pid].length = 0;
+          } else {
+            source.add(packet, config);
+          }
+        } else {
+          this.backlogMap[pid].push(packet);
+        }
+
+        if (this.output.state === 'pending' &&
+          Object.keys(this.sourceMap).length === Object.keys(this.streamMap).length
+        ) await this.output.start();
+
         break;
       }
       case StreamType.AUDIO_PCM: {
@@ -79,10 +162,10 @@ export default class Demuxer {
         const audio = data.slice(4);
 
         const channelLayout = pcmHeader[2] >> 4;
-        const numOfChannels = channelLayout === ChannelLayouts.MONO
+        const numberOfChannels = channelLayout === ChannelLayouts.MONO
           ? 1 : channelLayout === ChannelLayouts.STEREO
           ? 2 : null;
-        if (!numOfChannels) {
+        if (!numberOfChannels) {
           console.error('Only mono and stereo PCM currently supported.');
           return;
         }
@@ -95,55 +178,54 @@ export default class Demuxer {
           return;
         }
 
-        if (!this.fileHandleMap[pid]) {
-          const opfs = await navigator.storage.getDirectory();
-          const fh = await opfs.getFileHandle(`${pid}.wav`, { create: true });
-          this.fileHandleMap[pid] = await fh.createSyncAccessHandle();
-          const header = new ArrayBuffer(44);
-          const headerUint8 = new Uint8Array(header);
-          const headerView = new DataView(header);
-  
-          const textEncoder = new TextEncoder();
-          textEncoder.encodeInto('RIFF', headerUint8);
-          textEncoder.encodeInto('WAVE', headerUint8.subarray(8));
-          textEncoder.encodeInto('fmt ', headerUint8.subarray(12));
-          headerView.setUint32(16, 16, true);
-          headerView.setUint16(20, 1, true);
-          headerView.setUint16(22, numOfChannels, true);
-          headerView.setUint32(24, sampleRate, true);
-          headerView.setUint32(28, sampleRate * numOfChannels * bytesPerSample, true);
-          headerView.setUint16(32, numOfChannels * bytesPerSample, true);
-          headerView.setUint16(34, bitsPerSample, true);
-          textEncoder.encodeInto('data', headerUint8.subarray(36));
-          
-          this.fileHandleMap[pid].write(header);
-          this.fileHandleMap[pid].flush();
+        const streamInfo = this.streamMap[pid] as AudioStream;
+
+        if (!this.sourceMap[pid]) {
+          const init = this.streamArr.slice(0, this.streamMap[pid].idx)
+            .every(s => this.sourceMap[s.pid]);
+
+          if (init) {
+            this.sourceMap[pid] = new EncodedAudioPacketSource(
+              `pcm-s${bitsPerSample}be` as AudioCodec
+            );
+            this.output.addAudioTrack(this.sourceMap[pid], { languageCode: streamInfo.lang });
+          }
         }
 
-        for (let i = 0; i < audio.byteLength / bytesPerSample; i++) {
-          const oppIdx = (i + 1) * bytesPerSample - 1;
-          const byte = audio[oppIdx];
-          audio[oppIdx] = audio[i * bytesPerSample];
-          audio[i * bytesPerSample] = byte;
-        }
+        const source = this.sourceMap[pid] as EncodedAudioPacketSource;
 
-        this.fileHandleMap[pid].write(
-          audio, { at: this.fileHandleMap[pid].getSize() }
+        const packet = new EncodedPacket(
+          audio, 'key', ts, 
+          audio.byteLength / (sampleRate * numberOfChannels * bytesPerSample),
         );
-        this.fileHandleMap[pid].flush();
+
+        const config = {
+          decoderConfig: {
+            codec: 'pcm-s' + bitsPerSample,
+            numberOfChannels, sampleRate,
+          }
+        };
+
+        this.backlogMap[pid] ??= [];
+        if (this.output.state === 'started') {
+          if (this.backlogMap[pid].length) {
+            this.backlogMap[pid].map(packet => source.add(packet, config));
+            this.backlogMap[pid].length = 0;
+          } else {
+            source.add(packet, config);
+          }
+        } else {
+          this.backlogMap[pid].push(packet);
+        }
+
+        if (this.output.state === 'pending' &&
+          Object.keys(this.sourceMap).length === Object.keys(this.streamMap).length
+        ) await this.output.start();
 
         break;
       }
       case StreamType.PRESENTATION_GRAPHIC: {
-        if (!this.fileHandleMap[pid]) {
-          const opfs = await navigator.storage.getDirectory();
-          const fh = await opfs.getFileHandle(`${pid}.sup`, { create: true });
-          this.fileHandleMap[pid] = await fh.createSyncAccessHandle();
-        }
-        this.fileHandleMap[pid].write(
-          data, { at: this.fileHandleMap[pid].getSize() }
-        );
-        this.fileHandleMap[pid].flush();
+        
       }
     }
 
@@ -159,6 +241,8 @@ export default class Demuxer {
 
       if (done)
         break;
+
+      this.progress += value.byteLength;
 
       const currentData = new Uint8Array(leftovers.length + value.length);
       currentData.set(leftovers);
@@ -199,31 +283,10 @@ export default class Demuxer {
       const pid = parseInt(spid);
       if (this.chunksMap[pid].length)
         await this.parsePacket(pid);
-      if (this.streamMap[pid].codingType === StreamType.AUDIO_PCM) {
-        const chunkLength = new ArrayBuffer(4);
-        new DataView(chunkLength).setUint32(
-          0, this.fileHandleMap[pid].getSize() - 8
-        );
-        this.fileHandleMap[pid].write(chunkLength, { at: 4 });
-        new DataView(chunkLength).setUint32(
-          0, this.fileHandleMap[pid].getSize() - 8
-        );
-
-        const subchunkLength = new ArrayBuffer(4);
-        new DataView(subchunkLength).setUint32(
-          0, this.fileHandleMap[pid].getSize() - 44
-        );
-        this.fileHandleMap[pid].write(subchunkLength, { at: 0x28 });
-        new DataView(subchunkLength).setUint32(
-          0, this.fileHandleMap[pid].getSize() - 8
-        );
-
-        this.fileHandleMap[pid].flush();
-      }
-
-      this.fileHandleMap[pid].close();
+      this.sourceMap[pid].close();
     }
 
     console.log('done');
+    return this.output.finalize();
   }
 }
