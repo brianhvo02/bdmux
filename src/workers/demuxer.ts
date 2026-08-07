@@ -252,7 +252,8 @@ export const initialize = async function(rootDir: RootDirectory) {
 }
 
 export const processPlaylist = async function(
-  playlist: Playlist, chapters: PlaylistChapter[]
+  playlist: Playlist,
+  // chapters: PlaylistChapter[]
 ) {
   const clipInfo = await Promise.all(
     playlist.playitems.map(async ({ clipId }) => {
@@ -265,19 +266,20 @@ export const processPlaylist = async function(
     })
   ).then(info => info.reduce((map, i) => ({ ...map, ...i }), {}));
 
+  
   const playitem = playlist.playitems[0];
   
-  const opfs = await navigator.storage.getDirectory();
-  const fh = await opfs.getFileHandle(
-    `${playitem.clipId}.mkv`, { create: true }
-  );
-  const ws = await fh.createWritable();
+  // const opfs = await navigator.storage.getDirectory();
+  // const fh = await opfs.getFileHandle(
+  //   `${playitem.clipId}.mp4`, { create: true }
+  // );
+  // const ws = await fh.createWritable();
   
   const demuxer = new Demuxer(root.directory[
     `${root.name}/BDMV/STREAM/${playitem.clipId}.m2ts`
-  ], clipInfo[playitem.clipId], playitem.inTime, ws);
+  ], clipInfo[playitem.clipId], playitem);
 
   await demuxer.demux();
 
-  return fh.getFile();
+  // return fh.getFile();
 }

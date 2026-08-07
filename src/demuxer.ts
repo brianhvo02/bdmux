@@ -1,4 +1,4 @@
-import { EncodedAudioPacketSource, EncodedPacket, EncodedVideoPacketSource, MkvOutputFormat, Output, StreamTarget, type AudioCodec } from 'mediabunny';
+// import { EncodedAudioPacketSource, EncodedPacket, EncodedVideoPacketSource, Mp4OutputFormat, Output, StreamTarget, type AudioCodec } from 'mediabunny';
 
 enum StreamType {
   VIDEO_H264 = 0x1B,
@@ -36,32 +36,39 @@ export default class Demuxer {
   private streamMap: StreamMap;
   private streamArr: StreamInfoWithPid[];
   private streamSet = new Set<number>();
-  // private fileHandleMap: Record<number, FileSystemSyncAccessHandle> = {};
-  private sourceMap: Record<number, EncodedVideoPacketSource | EncodedAudioPacketSource> = {};
-  private output: Output;
-  private backlogMap: Record<number, EncodedPacket[]> = {};
-  private inTime: number;
+  // private sourceMap: Record<number, EncodedVideoPacketSource | EncodedAudioPacketSource> = {};
+  // private output: Output;
+  // private backlogMap: Record<number, EncodedPacket[]> = {};
+  private playitem: Playitem;
 
   size: number;
   progress = 0;
 
   constructor(
-    file: File, programs: StreamObj[], inTime: number,
-    writeStream: WritableStream,
+    file: File, programs: StreamObj[], playitem: Playitem,
+    // writeStream: WritableStream,
   ) {
     this.file = file;
     this.size = file.size;
     this.streamMap = programs[0].map;
     this.streamArr = programs[0].arr;
-    this.inTime = inTime;
+    this.playitem = playitem;
 
-    this.output = new Output({
-      format: new MkvOutputFormat(),
-      target: new StreamTarget(writeStream),
-      onFinalize() {
-        console.log('file written!');
-      }
-    });;
+    const { format, rate } = programs[0].arr[1] as AudioStream;
+    postMessage({ 
+      type: 'audio-init', 
+      channels: format === 1 ? 1 : 2, 
+      sampleRate: SAMPLE_RATES[rate] ?? 0, 
+      duration: (playitem.outTime - playitem.inTime) / 45000 }
+    );
+
+    // this.output = new Output({
+    //   format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+    //   target: new StreamTarget(writeStream),
+    //   onFinalize() {
+    //     console.log('file written!');
+    //   }
+    // });
 
     this.streamArr.forEach(s => {
       this.chunksMap[s.pid] = [];
@@ -99,7 +106,7 @@ export default class Demuxer {
       return;
     }
 
-    const ts = (timestamp - this.inTime * 4) / 180000;
+    const ts = (timestamp - this.playitem.inTime * 4) / 180000;
     const data = packet.slice(9 + headerLength);
 
     switch (this.streamMap[pid].codingType) {
@@ -114,22 +121,22 @@ export default class Demuxer {
               ? 60000/1001
               : VIDEO_RATES[streamInfo.rate];
 
-        if (!this.sourceMap[pid]) {
-          const init = this.streamArr.slice(0, this.streamMap[pid].idx)
-            .every(s => this.sourceMap[s.pid]);
+        // if (!this.sourceMap[pid]) {
+        //   const init = this.streamArr.slice(0, this.streamMap[pid].idx)
+        //     .every(s => this.sourceMap[s.pid]);
 
-          if (init) {
-            this.sourceMap[pid] = new EncodedVideoPacketSource('avc');
-            this.output.addVideoTrack(this.sourceMap[pid], { frameRate });
-          }
-        }
+        //   if (init) {
+        //     this.sourceMap[pid] = new EncodedVideoPacketSource('avc');
+        //     this.output.addVideoTrack(this.sourceMap[pid], { frameRate });
+        //   }
+        // }
 
-        const source = this.sourceMap[pid] as EncodedVideoPacketSource;
+        // const source = this.sourceMap[pid] as EncodedVideoPacketSource;
 
-        const packet = new EncodedPacket(
-          data, data[5] === 0x10 ? 'key' : 'delta', 
-          ts, 1 / frameRate,
-        );
+        // const packet = new EncodedPacket(
+        //   data, data[5] === 0x10 ? 'key' : 'delta', 
+        //   ts, 1 / frameRate,
+        // );
 
         const config = {
           decoderConfig: {
@@ -139,21 +146,21 @@ export default class Demuxer {
           }
         };
 
-        this.backlogMap[pid] ??= [];
-        if (this.output.state === 'started') {
-          if (this.backlogMap[pid].length) {
-            this.backlogMap[pid].map(packet => source.add(packet, config));
-            this.backlogMap[pid].length = 0;
-          } else {
-            source.add(packet, config);
-          }
-        } else {
-          this.backlogMap[pid].push(packet);
-        }
+        // this.backlogMap[pid] ??= [];
+        // if (this.output.state === 'started') {
+        //   if (this.backlogMap[pid].length) {
+        //     this.backlogMap[pid].map(packet => source.add(packet, config));
+        //     this.backlogMap[pid].length = 0;
+        //   } else {
+        //     source.add(packet, config);
+        //   }
+        // } else {
+        //   this.backlogMap[pid].push(packet);
+        // }
 
-        if (this.output.state === 'pending' &&
-          Object.keys(this.sourceMap).length === Object.keys(this.streamMap).length
-        ) await this.output.start();
+        // if (this.output.state === 'pending' &&
+        //   Object.keys(this.sourceMap).length === Object.keys(this.streamMap).length
+        // ) await this.output.start();
 
         break;
       }
@@ -178,49 +185,92 @@ export default class Demuxer {
           return;
         }
 
-        const streamInfo = this.streamMap[pid] as AudioStream;
+        // const channels = [...Array<Float32Array<ArrayBuffer>>(numberOfChannels)]
+        //   .map(() => new Float32Array(
+        //     audio.length / bytesPerSample / numberOfChannels
+        //   ));
 
-        if (!this.sourceMap[pid]) {
-          const init = this.streamArr.slice(0, this.streamMap[pid].idx)
-            .every(s => this.sourceMap[s.pid]);
+        // for (let idx = 0; idx < audio.length / bytesPerSample; idx++) {
+        //   const rawVal = (
+        //     audio[idx * bytesPerSample] << ((bytesPerSample - 2) ? 16 : 8)
+        //   ) | (
+        //     audio[idx * bytesPerSample + 1] << ((bytesPerSample - 2) ? 8 : 0)
+        //   ) | ((bytesPerSample - 2) ? audio[idx * 3 + 2] : 0);
 
-          if (init) {
-            this.sourceMap[pid] = new EncodedAudioPacketSource(
-              `pcm-s${bitsPerSample}be` as AudioCodec
-            );
-            this.output.addAudioTrack(this.sourceMap[pid], { languageCode: streamInfo.lang });
-          }
+        //   const val = audio[idx * bytesPerSample] & 0x80 ? rawVal - (
+        //     (bytesPerSample - 2) ? 0x1000000 : 0x10000
+        //   ) : rawVal;
+
+        //   channels[idx % 2][Math.floor(idx / 2)] = val / (
+        //     Math.pow(2, bitsPerSample - 1) - Number(val >= 0)
+        //   );
+        // }
+
+        // postMessage({ type: 'audio', channels, offset: ts * sampleRate });
+
+        const audioData = new Float32Array(audio.length / bytesPerSample);
+
+        for (let idx = 0; idx < audio.length / bytesPerSample; idx++) {
+          const rawVal = (
+            audio[idx * bytesPerSample] << ((bytesPerSample - 2) ? 16 : 8)
+          ) | (
+            audio[idx * bytesPerSample + 1] << ((bytesPerSample - 2) ? 8 : 0)
+          ) | ((bytesPerSample - 2) ? audio[idx * 3 + 2] : 0);
+
+          const val = audio[idx * bytesPerSample] & 0x80 ? rawVal - (
+            (bytesPerSample - 2) ? 0x1000000 : 0x10000
+          ) : rawVal;
+
+          audioData[idx] = val / (
+            Math.pow(2, bitsPerSample - 1) - Number(val >= 0)
+          );
         }
 
-        const source = this.sourceMap[pid] as EncodedAudioPacketSource;
+        postMessage({ type: 'audio', audioData });
 
-        const packet = new EncodedPacket(
-          audio, 'key', ts, 
-          audio.byteLength / (sampleRate * numberOfChannels * bytesPerSample),
-        );
+        // const streamInfo = this.streamMap[pid] as AudioStream;
 
-        const config = {
-          decoderConfig: {
-            codec: 'pcm-s' + bitsPerSample,
-            numberOfChannels, sampleRate,
-          }
-        };
+        // if (!this.sourceMap[pid]) {
+        //   const init = this.streamArr.slice(0, this.streamMap[pid].idx)
+        //     .every(s => this.sourceMap[s.pid]);
 
-        this.backlogMap[pid] ??= [];
-        if (this.output.state === 'started') {
-          if (this.backlogMap[pid].length) {
-            this.backlogMap[pid].map(packet => source.add(packet, config));
-            this.backlogMap[pid].length = 0;
-          } else {
-            source.add(packet, config);
-          }
-        } else {
-          this.backlogMap[pid].push(packet);
-        }
+        //   if (init) {
+        //     this.sourceMap[pid] = new EncodedAudioPacketSource(
+        //       `pcm-s${bitsPerSample}be` as AudioCodec
+        //     );
+        //     this.output.addAudioTrack(this.sourceMap[pid], { languageCode: streamInfo.lang });
+        //   }
+        // }
 
-        if (this.output.state === 'pending' &&
-          Object.keys(this.sourceMap).length === Object.keys(this.streamMap).length
-        ) await this.output.start();
+        // const source = this.sourceMap[pid] as EncodedAudioPacketSource;
+
+        // const packet = new EncodedPacket(
+        //   audio, 'key', ts, 
+        //   audio.byteLength / (sampleRate * numberOfChannels * bytesPerSample),
+        // );
+
+        // const config = {
+        //   decoderConfig: {
+        //     codec: 'pcm-s' + bitsPerSample,
+        //     numberOfChannels, sampleRate,
+        //   }
+        // };
+
+        // this.backlogMap[pid] ??= [];
+        // if (this.output.state === 'started') {
+        //   if (this.backlogMap[pid].length) {
+        //     this.backlogMap[pid].map(packet => source.add(packet, config));
+        //     this.backlogMap[pid].length = 0;
+        //   } else {
+        //     source.add(packet, config);
+        //   }
+        // } else {
+        //   this.backlogMap[pid].push(packet);
+        // }
+
+        // if (this.output.state === 'pending' &&
+        //   Object.keys(this.sourceMap).length === Object.keys(this.streamMap).length
+        // ) await this.output.start();
 
         break;
       }
@@ -283,10 +333,10 @@ export default class Demuxer {
       const pid = parseInt(spid);
       if (this.chunksMap[pid].length)
         await this.parsePacket(pid);
-      this.sourceMap[pid].close();
+      // this.sourceMap[pid].close();
     }
 
     console.log('done');
-    return this.output.finalize();
+    // return this.output.finalize();
   }
 }

@@ -1,9 +1,12 @@
 import './App.css';
+import processorUrl from './processor?url';
 import { ChevronRight } from '@mui/icons-material';
 import { Alert, Box, Button, CircularProgress, Input, List, ListItem, ListItemButton, ListItemIcon, ListItemText, ListSubheader } from '@mui/material';
 import { skipToken, useQuery } from '@tanstack/react-query';
 import { useCallback, useMemo, useState } from 'react';
 import { convertSecondsToTimestamp } from './utils.ts';
+import { endpointSymbol } from 'vite-plugin-comlink/symbol';
+import { AudioWriter, RingBuffer } from 'ringbuf.js';
 
 const demuxWorker = new ComlinkWorker<
   typeof import('./workers/demuxer.ts')
@@ -11,6 +14,61 @@ const demuxWorker = new ComlinkWorker<
   name: 'demuxerComlink',
   type: 'module',
 });
+
+const audioCtx = new AudioContext();
+// const sourceNode = audioCtx.createBufferSource();
+// sourceNode.connect(audioCtx.destination);
+// sourceNode.loop = true;
+// let buffer: AudioBuffer | null = null;
+// // audioCtx.createBuffer()
+let audioWriterPromise: Promise<AudioWriter>;
+
+demuxWorker[endpointSymbol].addEventListener('message', async ev => {
+  if (ev.data.type === 'audio-init') {
+    audioWriterPromise = audioCtx.audioWorklet.addModule(processorUrl)
+      .then(() => {
+        const sab = RingBuffer.getStorageForCapacity(
+          ev.data.sampleRate / 20, Float32Array
+        );
+
+        const rb = new RingBuffer(sab, Float32Array);
+        const audioWriter = new AudioWriter(rb);
+
+        const n = new AudioWorkletNode(audioCtx, 'processor', {
+          processorOptions: { audioQueue: sab },
+          outputChannelCount: [ev.data.channels],
+        });
+
+        n.connect(audioCtx.destination);
+
+        return audioWriter;
+      });
+    // buffer = audioCtx.createBuffer(
+    //   ev.data.channels,
+    //   ev.data.sampleRate * ev.data.duration,
+    //   ev.data.sampleRate,
+    // );
+    
+    // const audio = clipInfo[0][playitem.clipId as unknown as number].arr[1];
+  }
+
+  if (ev.data.type === 'audio') {
+    const audioWriter = await audioWriterPromise;
+    while (audioWriter.availableWrite() > 128) {
+      audioWriter.enqueue(ev.data.audioData);
+    }
+    // ev.data.channels.forEach((channel: Float32Array<ArrayBuffer>, i: number) => {
+    //   if (!buffer) return;
+
+    //   buffer.copyToChannel(channel, i, ev.data.offset);
+    // });
+
+    // if (!sourceNode.buffer) {
+    //   sourceNode.buffer = buffer;
+    //   sourceNode.start();
+    // }
+  }
+})
 
 const getFolder = async function(): Promise<GetFolderResult> {
   const inputEl = document.createElement('input');
@@ -59,7 +117,9 @@ export default function App() {
   const { data } = useQuery({
     queryKey: ['getPlaylist', playlist?.filenameStr],
     queryFn: playlist && processing 
-      ? async () => demuxWorker.processPlaylist(playlist.playlist, chapters)
+      ? async () => demuxWorker.processPlaylist(
+        playlist.playlist, 
+      )
       : skipToken,
     staleTime: Infinity,
   });
@@ -150,7 +210,7 @@ export default function App() {
       </List> }
       { processing && !url &&
       <CircularProgress /> }
-      {url && <video src={url} controls/>}
+      {/* url && <video src={url} controls/> */}
     </Box>
   );
 }
